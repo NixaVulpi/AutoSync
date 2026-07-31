@@ -1,0 +1,108 @@
+name: GitLab to GitHub Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *"
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: sync
+
+      - name: Extract Vpn
+        shell: pwsh
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.PASSWD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_PASSWORD)) {
+            throw "Secret PASSWD is empty or missing."
+          }
+
+          $archive = Join-Path $env:GITHUB_WORKSPACE "bin.7z"
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "VpnBin"
+
+          if (-not (Test-Path -LiteralPath $archive)) {
+            throw "Missing archive: $archive"
+          }
+
+          New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
+          7z x $archive "-o$vpnDir" "-p$env:ARCHIVE_PASSWORD" -y
+
+          $exe = Join-Path $vpnDir "vpn.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Missing executable after extraction: $exe"
+          }
+
+      - name: Write Vpn profiles
+        shell: pwsh
+        env:
+          PROFILES_JSON: ${{ secrets.PROFILES }}
+          PROFILES_DIR: ${{ secrets.PROFILES_DIR }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PROFILES_JSON)) {
+            throw "Secret PROFILES is empty or missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:PROFILES_DIR)) {
+            throw "Secret PROFILES_DIR is empty or missing."
+          }
+
+          if ([System.IO.Path]::IsPathRooted($env:PROFILES_DIR)) {
+            $profileDir = $env:PROFILES_DIR
+          } else {
+            $profileDir = Join-Path $env:LOCALAPPDATA $env:PROFILES_DIR
+          }
+          $profilePath = Join-Path $profileDir "profiles.json"
+
+          New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+          [System.IO.File]::WriteAllText(
+            $profilePath,
+            $env:PROFILES_JSON,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Start Vpn
+        shell: pwsh
+        run: |
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "VpnBin"
+          $exe = Join-Path $vpnDir "vpn.exe"
+
+          Start-Process `
+            -FilePath $exe `
+            -ArgumentList "--autostart" `
+            -WorkingDirectory $vpnDir `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 5
+
+      - name: Write sync config
+        shell: pwsh
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CONFIG_JSON)) {
+            throw "Secret CONFIG is empty or missing."
+          }
+
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "config.json"
+          [System.IO.File]::WriteAllText(
+            $configPath,
+            $env:CONFIG_JSON,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Sync repositories
+        shell: pwsh
+        run: |
+          $script = Join-Path $env:GITHUB_WORKSPACE "sync-gitlab-to-github.ps1"
+          if (-not (Test-Path -LiteralPath $script)) {
+            throw "Missing sync script: $script"
+          }
+
+          & $script -QuietOutput
