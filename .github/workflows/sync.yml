@@ -1,0 +1,376 @@
+name: Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *"
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Checkout sync tools
+        uses: actions/checkout@v7
+        with:
+          repository: NixaVulpi/GitLab2GitHubSyncTools
+          path: tools
+
+      - name: Load sync secrets
+        shell: pwsh
+        env:
+          SYNC_SECRETS_JSON: ${{ secrets.SYNC_SECRETS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_SECRETS_JSON)) {
+            throw "Secret SYNC_SECRETS is empty or missing."
+          }
+
+          try {
+            $secrets = $env:SYNC_SECRETS_JSON | ConvertFrom-Json
+          } catch {
+            throw "Secret SYNC_SECRETS is not valid JSON."
+          }
+
+          function Add-GlobalEnv {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Name,
+
+              [AllowNull()]
+              $Value
+            )
+
+            if ($null -eq $Value) {
+              throw "SYNC_SECRETS is missing required value: $Name"
+            }
+
+            if ($Value -is [string]) {
+              $text = $Value
+            } else {
+              $text = ConvertTo-Json -InputObject $Value -Depth 100 -Compress
+            }
+
+            if ([string]::IsNullOrWhiteSpace($text)) {
+              throw "SYNC_SECRETS is missing required value: $Name"
+            }
+
+            foreach ($line in ($text -split "(`r`n|`n|`r)")) {
+              if (-not [string]::IsNullOrWhiteSpace($line)) {
+                Write-Output "::add-mask::$line"
+              }
+            }
+
+            $delimiter = "EOF_$([Guid]::NewGuid().ToString('N'))"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$Name<<$delimiter"
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $text
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $delimiter
+          }
+
+          Add-GlobalEnv -Name "SYNC_ARCHIVE_PASSWORD" -Value $secrets.archive_password
+          Add-GlobalEnv -Name "SYNC_VPN_PROFILES_JSON" -Value $secrets.vpn_profiles_json
+          Add-GlobalEnv -Name "SYNC_VPN_PROFILES_DIR" -Value $secrets.vpn_profiles_dir
+          Add-GlobalEnv -Name "SYNC_GITLAB_HOST" -Value $secrets.gitlab_host
+          Add-GlobalEnv -Name "SYNC_GITLAB_SSH_PRIVATE_KEY" -Value $secrets.gitlab_ssh_private_key
+          Add-GlobalEnv -Name "SYNC_CONFIG_JSON" -Value $secrets.sync_config
+
+      - name: Check runner privileges
+        shell: pwsh
+        run: |
+          $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($current)
+          $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+          if (-not $isAdmin) {
+            throw "Runner is not running as administrator."
+          }
+
+          Write-Host "Runner is running as administrator."
+
+      - name: Download Vpn archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download bin `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern "bin.7z" `
+            --dir $env:GITHUB_WORKSPACE `
+            --clobber
+
+      - name: Extract Vpn
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_ARCHIVE_PASSWORD)) {
+            throw "SYNC_ARCHIVE_PASSWORD is empty or missing."
+          }
+
+          $archive = Join-Path $env:GITHUB_WORKSPACE "bin.7z"
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
+
+          if (-not (Test-Path -LiteralPath $archive)) {
+            throw "Missing archive: $archive"
+          }
+
+          New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
+          7z x $archive "-o$vpnDir" "-p$env:SYNC_ARCHIVE_PASSWORD" -y
+
+          $exe = Join-Path $vpnDir "vpn.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Missing executable after extraction: $exe"
+          }
+
+      - name: Restore encrypted mirror cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .gitlab-mirror-cache.7z
+          key: gitlab-mirror-cache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gitlab-mirror-cache-${{ runner.os }}-
+
+      - name: Extract mirror cache
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_ARCHIVE_PASSWORD)) {
+            throw "SYNC_ARCHIVE_PASSWORD is empty or missing."
+          }
+
+          $archive = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache.7z"
+          $cacheDir = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache"
+
+          if (-not (Test-Path -LiteralPath $archive)) {
+            Write-Host "No encrypted mirror cache was restored."
+            return
+          }
+
+          Remove-Item -LiteralPath $cacheDir -Recurse -Force -ErrorAction SilentlyContinue
+          7z x $archive "-o$env:GITHUB_WORKSPACE" "-p$env:SYNC_ARCHIVE_PASSWORD" -y
+
+          if (-not (Test-Path -LiteralPath $cacheDir)) {
+            throw "Encrypted mirror cache did not contain .gitlab-mirror-cache."
+          }
+
+      - name: Write Vpn profiles
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_VPN_PROFILES_JSON)) {
+            throw "SYNC_VPN_PROFILES_JSON is empty or missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_VPN_PROFILES_DIR)) {
+            throw "SYNC_VPN_PROFILES_DIR is empty or missing."
+          }
+
+          if ([System.IO.Path]::IsPathRooted($env:SYNC_VPN_PROFILES_DIR)) {
+            $profileDir = $env:SYNC_VPN_PROFILES_DIR
+          } else {
+            $profileDir = Join-Path $env:LOCALAPPDATA $env:SYNC_VPN_PROFILES_DIR
+          }
+          $profilePath = Join-Path $profileDir "profiles.json"
+
+          New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+          [System.IO.File]::WriteAllText(
+            $profilePath,
+            $env:SYNC_VPN_PROFILES_JSON,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          try {
+            $profiles = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+          } catch {
+            throw "profiles.json was written, but it is not valid JSON."
+          }
+
+          if ($profiles -is [string]) {
+            throw "profiles.json parsed as a JSON string. Set vpn_profiles_json to the profile array/object, not a quoted JSON string."
+          }
+
+          $profileRoot = Get-Content -LiteralPath $profilePath -Raw
+          if (-not $profileRoot.TrimStart().StartsWith("[")) {
+            throw "profiles.json root must be a JSON array."
+          }
+
+          $profileItems = @($profiles)
+          if ($profileItems.Count -lt 1) {
+            throw "profiles.json does not contain any VPN profiles."
+          }
+
+          $profileNames = @($profileItems | ForEach-Object { $_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          Write-Host "VPN profiles written: $($profileItems.Count)"
+          if ($profileNames.Count -gt 0) {
+            Write-Host "VPN profile names: $($profileNames -join ', ')"
+          }
+
+      - name: Start Vpn
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_GITLAB_HOST)) {
+            throw "SYNC_GITLAB_HOST is empty or missing."
+          }
+
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
+          $exe = Join-Path $vpnDir "vpn.exe"
+
+          $vpnProcess = Start-Process `
+            -FilePath $exe `
+            -ArgumentList "--autostart" `
+            -WorkingDirectory $vpnDir `
+            -WindowStyle Hidden `
+            -PassThru
+
+          Start-Sleep -Seconds 5
+          if ($vpnProcess.HasExited) {
+            throw "Vpn process exited early with code $($vpnProcess.ExitCode)."
+          }
+
+          Write-Host "Vpn process started."
+
+          Start-Sleep -Seconds 10
+
+          $reachable = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            if (Test-NetConnection -ComputerName $env:SYNC_GITLAB_HOST -Port 22 -InformationLevel Quiet) {
+              $reachable = $true
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $reachable) {
+            throw "GitLab SSH port is not reachable after starting Vpn."
+          }
+
+          Write-Host "GitLab SSH port is reachable."
+
+      - name: Configure SSH
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_GITLAB_SSH_PRIVATE_KEY)) {
+            throw "SYNC_GITLAB_SSH_PRIVATE_KEY is empty or missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_GITLAB_HOST)) {
+            throw "SYNC_GITLAB_HOST is empty or missing."
+          }
+
+          $sshDir = Join-Path $HOME ".ssh"
+          $keyPath = Join-Path $sshDir "id_ed25519"
+          $configPath = Join-Path $sshDir "config"
+          $knownHostsPath = Join-Path $sshDir "known_hosts"
+
+          New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+
+          $privateKey = $env:SYNC_GITLAB_SSH_PRIVATE_KEY -replace "\\n", "`n"
+          [System.IO.File]::WriteAllText(
+            $keyPath,
+            $privateKey.Trim() + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          icacls $keyPath /inheritance:r | Out-Null
+          icacls $keyPath /grant:r "$($env:USERNAME):(R)" | Out-Null
+
+          $sshConfig = @"
+          Host $($env:SYNC_GITLAB_HOST)
+            HostName $($env:SYNC_GITLAB_HOST)
+            User git
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile ~/.ssh/known_hosts
+          "@
+
+          [System.IO.File]::WriteAllText(
+            $configPath,
+            $sshConfig.Trim() + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+              $hostKeys = & ssh-keyscan -H $env:SYNC_GITLAB_HOST 2>$null
+              if ($hostKeys) {
+                $hostKeys | Out-File -FilePath $knownHostsPath -Encoding utf8 -Append
+              }
+            } catch {
+              Write-Host "ssh-keyscan did not return host keys on attempt $attempt; continuing with accept-new."
+            }
+
+            if ((Test-Path -LiteralPath $knownHostsPath) -and (Get-Item -LiteralPath $knownHostsPath).Length -gt 0) {
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          try {
+            $null = ssh -o BatchMode=yes -o ConnectTimeout=10 -T "git@$env:SYNC_GITLAB_HOST" 2>&1
+            $sshExitCode = $LASTEXITCODE
+          } catch {
+            $sshExitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 255 }
+          }
+
+          if ($sshExitCode -notin 0, 1) {
+            throw "GitLab SSH authentication test failed."
+          }
+
+          Write-Host "GitLab SSH authentication test completed."
+
+      - name: Write sync config
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_CONFIG_JSON)) {
+            throw "SYNC_CONFIG_JSON is empty or missing."
+          }
+
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "config.json"
+          [System.IO.File]::WriteAllText(
+            $configPath,
+            $env:SYNC_CONFIG_JSON,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Sync repositories
+        shell: pwsh
+        run: |
+          $script = Join-Path $env:GITHUB_WORKSPACE "tools\sync-gitlab-to-github.ps1"
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "config.json"
+          if (-not (Test-Path -LiteralPath $script)) {
+            throw "Missing sync script: $script"
+          }
+
+          & $script -ConfigPath $configPath -QuietOutput
+
+      - name: Pack encrypted mirror cache
+        if: always()
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_ARCHIVE_PASSWORD)) {
+            throw "SYNC_ARCHIVE_PASSWORD is empty or missing."
+          }
+
+          $cacheDir = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache"
+          $archive = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache.7z"
+
+          if (-not (Test-Path -LiteralPath $cacheDir)) {
+            Write-Host "No mirror cache directory was created."
+            return
+          }
+
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          Push-Location $env:GITHUB_WORKSPACE
+          try {
+            7z a $archive ".gitlab-mirror-cache" "-p$env:SYNC_ARCHIVE_PASSWORD" -mhe=on -mx=3
+          } finally {
+            Pop-Location
+          }
+
+      - name: Save encrypted mirror cache
+        if: always() && hashFiles('.gitlab-mirror-cache.7z') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: .gitlab-mirror-cache.7z
+          key: gitlab-mirror-cache-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
