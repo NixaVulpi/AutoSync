@@ -9,18 +9,29 @@ jobs:
   sync:
     runs-on: windows-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: sync
 
       - name: Checkout sync tools
         uses: actions/checkout@v4
         with:
           repository: NixaVulpi/GitLab2GitHubSyncTools
           path: tools
+
+      - name: Download Vpn archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download bin `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern "bin.7z" `
+            --dir $env:GITHUB_WORKSPACE `
+            --clobber
 
       - name: Extract Vpn
         shell: pwsh
