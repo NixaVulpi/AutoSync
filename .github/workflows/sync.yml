@@ -16,6 +16,12 @@ jobs:
         with:
           ref: sync
 
+      - name: Checkout sync tools
+        uses: actions/checkout@v4
+        with:
+          repository: NixaVulpi/GitLab2GitHubSyncTools
+          path: tools
+
       - name: Extract Vpn
         shell: pwsh
         env:
@@ -100,9 +106,10 @@ jobs:
       - name: Sync repositories
         shell: pwsh
         run: |
-          $script = Join-Path $env:GITHUB_WORKSPACE "sync-gitlab-to-github.ps1"
+          $script = Join-Path $env:GITHUB_WORKSPACE "tools\sync-gitlab-to-github.ps1"
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "config.json"
           if (-not (Test-Path -LiteralPath $script)) {
             throw "Missing sync script: $script"
           }
 
-          & $script -QuietOutput
+          & $script -ConfigPath $configPath -QuietOutput
