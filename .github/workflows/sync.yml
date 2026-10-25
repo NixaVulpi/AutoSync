@@ -311,7 +311,7 @@ jobs:
             $arguments += @('-ca', $caPath)
           } else {
             $arguments += '-insecure'
-            Write-Host "WARNING: unispoke certificate verification is disabled (set vpn_ca_pem to enable it)."
+            Write-Host "WARNING: unispoke TLS certificate verification is disabled for this connection."
           }
           if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_MODE)) { $arguments += @('-mode', $env:SYNC_VPN_MODE) }
           if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_DOMAIN)) { $arguments += @('-domain', $env:SYNC_VPN_DOMAIN) }
