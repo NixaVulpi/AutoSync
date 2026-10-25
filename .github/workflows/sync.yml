@@ -6,33 +6,7 @@ on:
     - cron: "30 0 * * 5"
 
 jobs:
-  export-cache:
-    runs-on: windows-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      actions: read
-
-    steps:
-      - name: Restore Windows mirror cache
-        uses: actions/cache/restore@v6
-        with:
-          path: .gitlab-mirror-cache.7z
-          key: export-mirror-cache
-          restore-keys: |
-            gitlab-mirror-cache-Windows-
-          fail-on-cache-miss: true
-
-      - name: Upload mirror cache artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mirror-cache
-          path: .gitlab-mirror-cache.7z
-          compression-level: 0
-          retention-days: 1
-
   sync:
-    needs: export-cache
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -237,7 +211,13 @@ jobs:
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache.7z"
-          $valid = (Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -ge 2GB
+          $valid = $false
+          if (Test-Path -LiteralPath $path) {
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if ($null -ne $item -and $item.Length -ge 2GB) {
+              $valid = $true
+            }
+          }
           if ($valid) {
             "need_legacy=false" >> $env:GITHUB_OUTPUT
             Write-Host "A complete mirror cache is already present."
@@ -253,6 +233,8 @@ jobs:
         with:
           name: mirror-cache
           path: ${{ github.workspace }}
+          run-id: 40187037844
+          github-token: ${{ github.token }}
 
       - name: Extract mirror cache
         shell: pwsh
