@@ -98,13 +98,6 @@ jobs:
             }
           }
 
-          $unispokeVersion = if ([string]::IsNullOrWhiteSpace([string]$secrets.unispoke_version)) {
-            "v0.1.0"
-          } else {
-            [string]$secrets.unispoke_version
-          }
-
-          Add-GlobalEnv -Name "SYNC_UNISPOKE_VERSION" -Value $unispokeVersion -NoMask
           Add-GlobalEnv -Name "SYNC_VPN_CA_PEM" -Value $secrets.vpn_ca_pem -Optional -NoMask
           Add-GlobalEnv -Name "SYNC_VPN_DOMAIN" -Value $secrets.vpn_domain -Optional -NoMask
           Add-GlobalEnv -Name "SYNC_VPN_SNI" -Value $secrets.vpn_sni -Optional -NoMask
@@ -168,14 +161,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SYNC_UNISPOKE_VERSION)) {
-            throw "SYNC_UNISPOKE_VERSION is empty or missing."
-          }
+          $version = "v0.1.3"
 
           $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
           New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
 
-          gh release download $env:SYNC_UNISPOKE_VERSION `
+          gh release download $version `
             --repo NixaVulpi/unispoke `
             --pattern "unispoke-linux-amd64" `
             --pattern "SHA256SUMS" `
@@ -204,7 +195,7 @@ jobs:
           Move-Item -LiteralPath $binaryPath -Destination $destination -Force
           & chmod +x $destination
           Remove-Item -LiteralPath $sumsPath -Force -ErrorAction SilentlyContinue
-          Write-Host "unispoke $env:SYNC_UNISPOKE_VERSION downloaded and verified."
+          Write-Host "unispoke $version downloaded and verified."
 
       - name: Restore encrypted mirror cache
         uses: actions/cache/restore@v6
