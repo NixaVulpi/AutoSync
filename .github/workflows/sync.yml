@@ -11,6 +11,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -204,6 +205,65 @@ jobs:
           key: gitlab-mirror-cache-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             gitlab-mirror-cache-
+
+      - name: Restore legacy mirror cache
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archivePath = Join-Path $env:GITHUB_WORKSPACE ".gitlab-mirror-cache.7z"
+          if ((Test-Path -LiteralPath $archivePath) -and (Get-Item -LiteralPath $archivePath).Length -ge 2GB) {
+            Write-Host "A complete mirror cache is already present; skipping legacy restore."
+            return
+          }
+
+          $headers = @{
+            Authorization          = "Bearer $env:GH_TOKEN"
+            Accept                 = "application/vnd.github+json"
+            "User-Agent"           = "autosync"
+          }
+          $caches = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" `
+            -Headers $headers
+
+          $legacy = @($caches.actions_caches |
+            Where-Object { $_.key -like "gitlab-mirror-cache-Windows-*" } |
+            Sort-Object created_at -Descending) | Select-Object -First 1
+
+          if ($null -eq $legacy) {
+            Write-Host "No legacy Windows mirror cache was found."
+            return
+          }
+
+          Write-Host "Restoring legacy mirror cache: $($legacy.key) ($([math]::Round($legacy.size_in_bytes / 1MB, 1)) MB)"
+
+          $info = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/caches/$($legacy.id)" `
+            -Headers $headers
+
+          $zip = Join-Path $env:RUNNER_TEMP "legacy-mirror-cache.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "legacy-mirror-cache"
+          Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          & curl -L --fail --retry 3 --silent --show-error -o $zip $info.archive_download_url
+          if ($LASTEXITCODE -ne 0) {
+            throw "Legacy cache download failed."
+          }
+
+          7z x $zip "-o$extractDir" -y | Out-Null
+          $inner = Get-ChildItem -Path $extractDir -Recurse -Filter ".gitlab-mirror-cache.7z" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($null -eq $inner) {
+            throw "Legacy cache archive did not contain .gitlab-mirror-cache.7z."
+          }
+
+          Copy-Item -LiteralPath $inner.FullName -Destination $archivePath -Force
+          Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          & df -h $env:GITHUB_WORKSPACE | Write-Host
+          Write-Host "Legacy mirror cache restored."
 
       - name: Extract mirror cache
         shell: pwsh
