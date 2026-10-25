@@ -43,10 +43,15 @@ jobs:
               [string]$Name,
 
               [AllowNull()]
-              $Value
+              $Value,
+
+              [switch]$Optional,
+
+              [switch]$NoMask
             )
 
             if ($null -eq $Value) {
+              if ($Optional) { return }
               throw "SYNC_SECRETS is missing required value: $Name"
             }
 
@@ -57,12 +62,15 @@ jobs:
             }
 
             if ([string]::IsNullOrWhiteSpace($text)) {
+              if ($Optional) { return }
               throw "SYNC_SECRETS is missing required value: $Name"
             }
 
-            foreach ($line in ($text -split "(`r`n|`n|`r)")) {
-              if (-not [string]::IsNullOrWhiteSpace($line)) {
-                Write-Output "::add-mask::$line"
+            if (-not $NoMask) {
+              foreach ($line in ($text -split "(`r`n|`n|`r)")) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                  Write-Output "::add-mask::$line"
+                }
               }
             }
 
@@ -74,10 +82,34 @@ jobs:
 
           Add-GlobalEnv -Name "SYNC_ARCHIVE_PASSWORD" -Value $secrets.archive_password
           Add-GlobalEnv -Name "SYNC_VPN_PROFILES_JSON" -Value $secrets.vpn_profiles_json
-          Add-GlobalEnv -Name "SYNC_VPN_PROFILES_DIR" -Value $secrets.vpn_profiles_dir
           Add-GlobalEnv -Name "SYNC_GITLAB_HOST" -Value $secrets.gitlab_host
           Add-GlobalEnv -Name "SYNC_GITLAB_SSH_PRIVATE_KEY" -Value $secrets.gitlab_ssh_private_key
           Add-GlobalEnv -Name "SYNC_CONFIG_JSON" -Value $secrets.sync_config
+
+          # Optional unispoke settings. These are not secrets, so they are not masked.
+          $syncConfig = $secrets.sync_config
+          if ($syncConfig -is [string]) {
+            $syncConfig = $syncConfig | ConvertFrom-Json
+          }
+          foreach ($tokenName in @("github_token", "gitlab_token")) {
+            $tokenValue = $syncConfig.$tokenName
+            if (-not [string]::IsNullOrWhiteSpace($tokenValue)) {
+              Write-Output "::add-mask::$tokenValue"
+            }
+          }
+
+          $unispokeVersion = if ([string]::IsNullOrWhiteSpace([string]$secrets.unispoke_version)) {
+            "v0.1.0"
+          } else {
+            [string]$secrets.unispoke_version
+          }
+
+          Add-GlobalEnv -Name "SYNC_UNISPOKE_VERSION" -Value $unispokeVersion -NoMask
+          Add-GlobalEnv -Name "SYNC_VPN_CA_PEM" -Value $secrets.vpn_ca_pem -Optional -NoMask
+          Add-GlobalEnv -Name "SYNC_VPN_DOMAIN" -Value $secrets.vpn_domain -Optional -NoMask
+          Add-GlobalEnv -Name "SYNC_VPN_SNI" -Value $secrets.vpn_sni -Optional -NoMask
+          Add-GlobalEnv -Name "SYNC_VPN_MODE" -Value $secrets.vpn_mode -Optional -NoMask
+          Add-GlobalEnv -Name "SYNC_VPN_MSS" -Value $secrets.vpn_mss -Optional -NoMask
 
       - name: Check runner privileges
         shell: pwsh
@@ -92,7 +124,7 @@ jobs:
 
           Write-Host "Runner is running as administrator."
 
-      - name: Download Vpn archive
+      - name: Download VPN support files
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,7 +135,7 @@ jobs:
             --dir $env:GITHUB_WORKSPACE `
             --clobber
 
-      - name: Extract Vpn
+      - name: Extract VPN support files
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:SYNC_ARCHIVE_PASSWORD)) {
@@ -120,10 +152,55 @@ jobs:
           New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
           7z x $archive "-o$vpnDir" "-p$env:SYNC_ARCHIVE_PASSWORD" -y
 
-          $exe = Join-Path $vpnDir "vpn.exe"
-          if (-not (Test-Path -LiteralPath $exe)) {
-            throw "Missing executable after extraction: $exe"
+          $wintun = Get-ChildItem -Path $vpnDir -Recurse -Filter "wintun.dll" -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($null -eq $wintun) {
+            throw "Missing wintun.dll after extraction."
           }
+          if ($wintun.DirectoryName -ne $vpnDir) {
+            Copy-Item -LiteralPath $wintun.FullName -Destination (Join-Path $vpnDir "wintun.dll") -Force
+          }
+
+      - name: Download unispoke
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SYNC_UNISPOKE_VERSION)) {
+            throw "SYNC_UNISPOKE_VERSION is empty or missing."
+          }
+
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
+          New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
+
+          gh release download $env:SYNC_UNISPOKE_VERSION `
+            --repo NixaVulpi/unispoke `
+            --pattern "unispoke-windows-amd64.exe" `
+            --pattern "SHA256SUMS" `
+            --dir $vpnDir `
+            --clobber
+
+          $sumsPath = Join-Path $vpnDir "SHA256SUMS"
+          $binaryPath = Join-Path $vpnDir "unispoke-windows-amd64.exe"
+          if (-not (Test-Path -LiteralPath $binaryPath) -or -not (Test-Path -LiteralPath $sumsPath)) {
+            throw "unispoke release download is incomplete."
+          }
+
+          $expected = (Get-Content -LiteralPath $sumsPath |
+            Where-Object { $_ -match '\s+unispoke-windows-amd64\.exe\s*$' } |
+            Select-Object -First 1) -replace '\s+unispoke-windows-amd64\.exe\s*$', ''
+          if ([string]::IsNullOrWhiteSpace($expected)) {
+            throw "SHA256SUMS does not contain unispoke-windows-amd64.exe."
+          }
+
+          $actual = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash
+          if ($actual -ne $expected.Trim().ToUpperInvariant()) {
+            throw "unispoke checksum mismatch."
+          }
+
+          Move-Item -LiteralPath $binaryPath -Destination (Join-Path $vpnDir "unispoke.exe") -Force
+          Remove-Item -LiteralPath $sumsPath -Force -ErrorAction SilentlyContinue
+          Write-Host "unispoke $env:SYNC_UNISPOKE_VERSION downloaded and verified."
 
       - name: Restore encrypted mirror cache
         uses: actions/cache/restore@v6
@@ -155,96 +232,148 @@ jobs:
             throw "Encrypted mirror cache did not contain .gitlab-mirror-cache."
           }
 
-      - name: Write Vpn profiles
+      - name: Start VPN
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:SYNC_VPN_PROFILES_JSON)) {
             throw "SYNC_VPN_PROFILES_JSON is empty or missing."
           }
-          if ([string]::IsNullOrWhiteSpace($env:SYNC_VPN_PROFILES_DIR)) {
-            throw "SYNC_VPN_PROFILES_DIR is empty or missing."
-          }
-
-          if ([System.IO.Path]::IsPathRooted($env:SYNC_VPN_PROFILES_DIR)) {
-            $profileDir = $env:SYNC_VPN_PROFILES_DIR
-          } else {
-            $profileDir = Join-Path $env:LOCALAPPDATA $env:SYNC_VPN_PROFILES_DIR
-          }
-          $profilePath = Join-Path $profileDir "profiles.json"
-
-          New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
-          [System.IO.File]::WriteAllText(
-            $profilePath,
-            $env:SYNC_VPN_PROFILES_JSON,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          try {
-            $profiles = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-          } catch {
-            throw "profiles.json was written, but it is not valid JSON."
-          }
-
-          if ($profiles -is [string]) {
-            throw "profiles.json parsed as a JSON string. Set vpn_profiles_json to the profile array/object, not a quoted JSON string."
-          }
-
-          $profileRoot = Get-Content -LiteralPath $profilePath -Raw
-          if (-not $profileRoot.TrimStart().StartsWith("[")) {
-            throw "profiles.json root must be a JSON array."
-          }
-
-          $profileItems = @($profiles)
-          if ($profileItems.Count -lt 1) {
-            throw "profiles.json does not contain any VPN profiles."
-          }
-
-          $profileNames = @($profileItems | ForEach-Object { $_.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-          Write-Host "VPN profiles written: $($profileItems.Count)"
-          if ($profileNames.Count -gt 0) {
-            Write-Host "VPN profile names: $($profileNames -join ', ')"
-          }
-
-      - name: Start Vpn
-        shell: pwsh
-        run: |
           if ([string]::IsNullOrWhiteSpace($env:SYNC_GITLAB_HOST)) {
             throw "SYNC_GITLAB_HOST is empty or missing."
           }
 
-          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
-          $exe = Join-Path $vpnDir "vpn.exe"
-
-          $vpnProcess = Start-Process `
-            -FilePath $exe `
-            -ArgumentList "--autostart" `
-            -WorkingDirectory $vpnDir `
-            -WindowStyle Hidden `
-            -PassThru
-
-          Start-Sleep -Seconds 5
-          if ($vpnProcess.HasExited) {
-            throw "Vpn process exited early with code $($vpnProcess.ExitCode)."
+          $profiles = $env:SYNC_VPN_PROFILES_JSON | ConvertFrom-Json
+          if ($profiles -is [string]) {
+            $profiles = $profiles | ConvertFrom-Json
+          }
+          $profile = @($profiles) | Select-Object -First 1
+          if ($null -eq $profile -or [string]::IsNullOrWhiteSpace([string]$profile.Server) -or $null -eq $profile.Port) {
+            throw "SYNC_SECRETS.vpn_profiles_json does not contain a usable profile (Server/Port)."
           }
 
-          Write-Host "Vpn process started."
+          $gateway = "$($profile.Server):$($profile.Port)"
+          $user = [string]$profile.Username
+          $password = [string]$profile.Password
+          if ([string]::IsNullOrWhiteSpace($user) -or [string]::IsNullOrWhiteSpace($password)) {
+            throw "SYNC_SECRETS.vpn_profiles_json profile is missing Username/Password."
+          }
 
-          Start-Sleep -Seconds 10
+          # Mask every derived value before it can reach the log.
+          foreach ($value in @($gateway, $user, $password)) {
+            Write-Output "::add-mask::$value"
+          }
+          foreach ($value in @($env:SYNC_VPN_DOMAIN, $env:SYNC_VPN_SNI)) {
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+              Write-Output "::add-mask::$value"
+            }
+          }
 
-          $reachable = $false
-          for ($attempt = 1; $attempt -le 12; $attempt++) {
-            if (Test-NetConnection -ComputerName $env:SYNC_GITLAB_HOST -Port 22 -InformationLevel Quiet) {
-              $reachable = $true
-              break
+          $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
+          $exe = Join-Path $vpnDir "unispoke.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Missing executable: $exe"
+          }
+
+          $caPath = Join-Path $vpnDir "ca.pem"
+          Remove-Item -LiteralPath $caPath -Force -ErrorAction SilentlyContinue
+          if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_CA_PEM)) {
+            [System.IO.File]::WriteAllText(
+              $caPath,
+              $env:SYNC_VPN_CA_PEM,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+          }
+
+          $mss = 0
+          if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_MSS)) {
+            $mss = [int]$env:SYNC_VPN_MSS
+          } elseif ($null -ne $profile.AdapterMtu -and [int]$profile.AdapterMtu -gt 40) {
+            $mss = [int]$profile.AdapterMtu - 40
+          }
+
+          function ConvertTo-ArgToken {
+            param([string]$Value)
+            if ($Value -match '[\s"]') {
+              return '"' + ($Value -replace '"', '\"') + '"'
+            }
+            return $Value
+          }
+
+          $arguments = @(
+            '-gateway', $gateway,
+            '-user', $user,
+            '-vpn',
+            '-vpn-name', 'unispoke',
+            '-log-level', 'warn',
+            '-timeout', '30s'
+          )
+          if (Test-Path -LiteralPath $caPath) {
+            $arguments += @('-ca', $caPath)
+          } else {
+            $arguments += '-insecure'
+            Write-Host "WARNING: unispoke certificate verification is disabled (set vpn_ca_pem to enable it)."
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_MODE)) { $arguments += @('-mode', $env:SYNC_VPN_MODE) }
+          if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_DOMAIN)) { $arguments += @('-domain', $env:SYNC_VPN_DOMAIN) }
+          if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_SNI)) { $arguments += @('-sni', $env:SYNC_VPN_SNI) }
+          if ($mss -gt 0) { $arguments += @('-mss', "$mss") }
+          $argumentLine = ($arguments | ForEach-Object { ConvertTo-ArgToken $_ }) -join ' '
+
+          $stdoutPath = Join-Path $env:RUNNER_TEMP "unispoke.out.log"
+          $stderrPath = Join-Path $env:RUNNER_TEMP "unispoke.err.log"
+          $connected = $false
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+            $env:UNISPOKE_PASSWORD = $password
+
+            $vpnProcess = Start-Process `
+              -FilePath $exe `
+              -ArgumentList $argumentLine `
+              -WorkingDirectory $vpnDir `
+              -WindowStyle Hidden `
+              -PassThru `
+              -RedirectStandardOutput $stdoutPath `
+              -RedirectStandardError $stderrPath
+
+            Write-Host "unispoke started (attempt $attempt)."
+
+            for ($wait = 1; $wait -le 60; $wait++) {
+              if ($vpnProcess.HasExited) { break }
+              if (Test-NetConnection -ComputerName $env:SYNC_GITLAB_HOST -Port 22 -InformationLevel Quiet) {
+                $connected = $true
+                break
+              }
+              Start-Sleep -Seconds 2
             }
 
-            Start-Sleep -Seconds 5
+            if ($connected) { break }
+            if (-not $vpnProcess.HasExited) {
+              Stop-Process -Id $vpnProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
           }
 
-          if (-not $reachable) {
-            throw "GitLab SSH port is not reachable after starting Vpn."
+          Remove-Item Env:\UNISPOKE_PASSWORD -ErrorAction SilentlyContinue
+
+          if (-not $connected) {
+            $maskValues = @($gateway, $user, $password, $env:SYNC_VPN_DOMAIN, $env:SYNC_VPN_SNI) |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            if (Test-Path -LiteralPath $stderrPath) {
+              Get-Content -LiteralPath $stderrPath -Tail 12 | ForEach-Object {
+                $line = $_
+                foreach ($value in $maskValues) {
+                  $line = $line.Replace($value, '***')
+                }
+                $line = $line -replace '\b(?:\d{1,3}\.){3}\d{1,3}\b', '<ip>'
+                $line = $line -replace '(uid=)0x[0-9a-fA-F]+', '${1}<id>'
+                Write-Host $line
+              }
+            }
+            throw "VPN did not become ready after 3 attempts."
           }
 
+          Write-Host "VPN connected."
           Write-Host "GitLab SSH port is reachable."
 
       - name: Configure SSH
@@ -343,6 +472,28 @@ jobs:
           }
 
           & $script -ConfigPath $configPath -QuietOutput
+
+      - name: Stop VPN
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process -Name "unispoke" -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host "unispoke stopped."
+
+      - name: Remove sensitive files
+        if: always()
+        shell: pwsh
+        run: |
+          $paths = @(
+            (Join-Path $env:GITHUB_WORKSPACE "config.json"),
+            (Join-Path $env:GITHUB_WORKSPACE "vpn\ca.pem"),
+            (Join-Path $env:RUNNER_TEMP "unispoke.out.log"),
+            (Join-Path $env:RUNNER_TEMP "unispoke.err.log")
+          )
+          foreach ($path in $paths) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Pack encrypted mirror cache
         if: always()
