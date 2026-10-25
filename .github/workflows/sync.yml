@@ -247,16 +247,30 @@ jobs:
             $profiles = $profiles | ConvertFrom-Json
           }
           $profile = @($profiles) | Select-Object -First 1
-          if ($null -eq $profile -or [string]::IsNullOrWhiteSpace([string]$profile.Server) -or $null -eq $profile.Port) {
-            throw "SYNC_SECRETS.vpn_profiles_json does not contain a usable profile (Server/Port)."
+
+          function Get-ProfileValue {
+            param($Object, [string[]]$Names)
+            foreach ($name in $Names) {
+              $property = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+              if ($null -ne $property) { return $property.Value }
+            }
+            return $null
           }
 
-          $gateway = "$($profile.Server):$($profile.Port)"
-          $user = [string]$profile.Username
-          $password = [string]$profile.Password
-          if ([string]::IsNullOrWhiteSpace($user) -or [string]::IsNullOrWhiteSpace($password)) {
-            throw "SYNC_SECRETS.vpn_profiles_json profile is missing Username/Password."
+          $server = [string](Get-ProfileValue $profile @("server", "Server"))
+          $port = Get-ProfileValue $profile @("port", "Port")
+          $user = [string](Get-ProfileValue $profile @("username", "Username"))
+          $password = [string](Get-ProfileValue $profile @("password", "Password"))
+          $adapterMtu = Get-ProfileValue $profile @("adapter_mtu", "AdapterMtu")
+
+          if ([string]::IsNullOrWhiteSpace($server) -or $null -eq $port) {
+            throw "SYNC_SECRETS.vpn_profiles_json does not contain a usable profile (server/port)."
           }
+          if ([string]::IsNullOrWhiteSpace($user) -or [string]::IsNullOrWhiteSpace($password)) {
+            throw "SYNC_SECRETS.vpn_profiles_json profile is missing username/password."
+          }
+
+          $gateway = "${server}:${port}"
 
           # Mask every derived value before it can reach the log.
           foreach ($value in @($gateway, $user, $password)) {
@@ -287,8 +301,8 @@ jobs:
           $mss = 0
           if (-not [string]::IsNullOrWhiteSpace($env:SYNC_VPN_MSS)) {
             $mss = [int]$env:SYNC_VPN_MSS
-          } elseif ($null -ne $profile.AdapterMtu -and [int]$profile.AdapterMtu -gt 40) {
-            $mss = [int]$profile.AdapterMtu - 40
+          } elseif ($null -ne $adapterMtu -and [int]$adapterMtu -gt 40) {
+            $mss = [int]$adapterMtu - 40
           }
 
           function ConvertTo-ArgToken {
