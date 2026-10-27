@@ -189,7 +189,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = "v0.2.1"
+          $version = "v0.2.2"
 
           $vpnDir = Join-Path $env:GITHUB_WORKSPACE "vpn"
           New-Item -ItemType Directory -Path $vpnDir -Force | Out-Null
